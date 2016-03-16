@@ -1,0 +1,627 @@
+---
+title: "White Wine Dataset Analysis"
+author: "Stefan Dulman"
+#date: "24 Feb 2016"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+
+# set some default options like:
+# - hiding warnings and code, 
+# - setting the size for figures
+# - saving all figures in a folder
+knitr::opts_chunk$set(fig.width=12, 
+                      fig.height=8, 
+                      fig.path='figs/',
+                      echo=FALSE, 
+                      warning=FALSE, 
+                      message=FALSE,
+                      include=FALSE)
+
+```
+
+```{r preamble}
+
+# prerequisites
+library(ggplot2)
+library(GGally)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(grid)
+library(gridExtra)
+library(caret)
+library(randomForest)
+library(corrplot)
+library(imager)
+
+
+# function adds statistics lines to ggplot histograms
+#    x - data for which statistics needs to be computed
+#    return - a list of commands for ggplot
+addstat <- function(x) {
+  # compute the quantiles
+  q <- quantile(x, probs=c(0.25, 0.5, 0.75))
+  # compute the mean value
+  m <- mean(x)
+  # draw quantiles and mean
+  return(list(
+    geom_vline(xintercept=q, color='red', linetype="dashed", size=0.5), 
+    geom_vline(xintercept=m, color='blue', size=0.3)))
+}
+
+
+# convenience function to draw a histogram with proper name and stats lines
+#   data.name - data frame to be used
+#   data.x - column number in the data frame
+#   uselog - boolean indicating wether the log10 function should be used
+#   returns - the graphics object
+drawhist <- function(data.name, data.x, uselog=FALSE) {
+  
+  # extract column name
+  colname <- colnames(data.name)[data.x]
+  
+  # create graph objects based on the log flag
+  if (uselog == TRUE) {
+    # main plot
+    myobj <- ggplot(data.name, aes(x=log10(eval(parse(text=colname)))))
+    # custom statistics lines
+    mystat <- addstat(log10(data.name[, data.x]))
+  } else {
+    myobj <- ggplot(data.name, aes(x=eval(parse(text=colname))))
+    mystat <- addstat(data.name[, data.x])
+  }
+      
+  return(
+    myobj +
+    geom_histogram() +
+    labs(x=colname) +
+    mystat +
+    theme_bw())
+}
+
+
+# load the data file
+wines <- read.csv('wineQualityWhites.csv')
+
+```
+
+### Intro
+
+In this project, I will focus on the white wine data set provided by udacity. This dataset contains 4898 observations of various Portuguese "Vinho Verde" white wines. Eleven different characteristics were recorded by measuring physical characteristics of the wines. Additionally, an estimate of the quality of wine by a set of experts was made available. Together with a vector assigning unique consecutive numbers to the measurements this leads to 13 different variables in our dataset:
+
+```{r include=TRUE}
+
+# list the variables in the dataset
+str(wines)
+
+```
+
+------
+
+### Univariate Analysis
+
+The start point of our analysis is to inspect each of the variables and observe their distributions. All the physical measurements are float numbers, while the quality of the wines is given as an integer. The statistics of these variables are:
+
+```{r include=TRUE}
+
+# list the statistics of the variables in the dataset
+summary(wines[ , 2:13])
+
+```
+
+This table gives a general idea on the range of the values and the quantiles. To be noticed that the data set is clean and has no missing values. Representing the data as histograms should present a more clear picture:
+
+```{r include=TRUE}
+
+# plot the histograms of the twelve variables of interest
+univhists <- lapply(2:13, function(x) drawhist(wines, x))
+do.call("grid.arrange", c(univhists, ncol=4))
+
+```
+
+These graphs show the distribution of univariate data. As expected, the 'quality' variable is the only discrete variable with just a few levels (for example, the alcohol variable is also discrete but on 103 values). 
+
+The 'quality' distribution looks normal, with few outliers (very bad wines marked with 3 and very good ones marked with 9). The large majority of wines are "normal" quality, leading to an unbalanced data set when it comes to training estimators.
+
+Some of the distributions look skewed - I will focus on the 'residual.sugar':
+
+```{r include=TRUE, fig.width=8, fig.height=3}
+
+# add a new variable for thresholded sugar
+wines$thr.sugar <- cut(wines$residual.sugar, 
+                      breaks=c(0, 4, 12, 45, Inf), 
+                      labels=c("dry", 
+                               "medium-dry", 
+                               "medium", 
+                               "sweet"))
+
+# plot the histogram
+ggplot(wines, aes(x=residual.sugar)) + 
+  scale_x_log10(
+    breaks=c(0.1,1,2,5,10,20,50),
+    labels=waiver()) + 
+  geom_histogram(aes(fill=wines$thr.sugar), binwidth=.03) + 
+  labs(fill="Wine sweetness") +
+  addstat(wines$residual.sugar) +
+  theme_bw()
+
+```
+
+Plotting the density of the residual sugar on a logarithmic x scale reveals a multimodal distribution with a clear cut point around 3.5 (the cut point between dry and medium-dry wines is usually around 4) and a second one around 10 (the cut point between medium-dry and medium wines is usually around 12). The wikipedia page for white wines [https://en.wikipedia.org/wiki/Sweetness_of_wine] mentions that it is very rare to find wines with residual sugar values of less than 1g/L. This is confirmed by our data set:
+
+```{r include=TRUE}
+
+# find the number of wines with low residual sugar
+low.sugar.wines <- wines$residual.sugar[wines$residual.sugar < 1]
+total.wines <- length(wines$residual.sugar)
+paste("percentage of wines with low residual sugar: ", 
+      100*length(low.sugar.wines)/total.wines, "%", sep="")
+
+```
+
+The same wikipedia page mentions that, as a general rule of thumb, wines with a residual sugar over 45g/L are considered sweet. Our data set is heavily biased from this perspective, the amount of entries in each taste category being:
+```{r include=TRUE}
+
+# group wines by sugar value
+table(wines$thr.sugar)
+
+```
+
+This data set has only one sweet wine entry in almost 5000 entries! Either the region/producers from which the data is collected specializes in dry wines or there might be a systematic error in the measurement of residual sugar. 
+
+We confirm that the three peaks we see in the data correspond to the rough categories described on the wikipedia page (the cut points suggested by wikipedia being 4, 12 and 35). 
+
+Using a logarithmic scale makes some of the distributions look more close to normal distributions, without revealing multimodality:
+
+```{r include=TRUE, fig.width=12, fig.height=3}
+
+# plot a few distributions using log transformation
+logdistrib <- lapply(c(3, 6, 7, 11), function(x) drawhist(wines, x, TRUE))
+do.call("grid.arrange", c(logdistrib, ncol=4))
+
+```
+
+The graph of the alcohol has an interesting shape:
+
+```{r include=TRUE, fig.width=8, fig.height=3}
+
+# create a thresholded value for alcohol
+wines$thr.alcohol <- cut(wines$alcohol, 
+                        breaks=c(0, 12.5, 13.5, 14.5, Inf), 
+                        labels=c("very-low", 
+                                 "moderately-low", 
+                                 "high", 
+                                 "very-high"), 
+                        ordered_result=TRUE)
+
+# draw the histogram
+ggplot(wines, aes(x=alcohol, xlab="alcohol")) + 
+  geom_histogram(aes(fill=thr.alcohol), binwidth=.1) + 
+  ggtitle("Alcohol distribution") +
+  labs(fill="Alcohol content") +
+  addstat(wines$alcohol) +
+  theme_bw()
+
+```
+
+According to this link: [http://www.realsimple.com/holidays-entertaining/entertaining/food-drink/alcohol-content-wine] wine can be classified in four categories, with the cut points at 12.5%, 13.5% and 14.5%:
+
+```{r include=TRUE}
+
+# group wines by alcohol
+table(wines$thr.alcohol)
+
+```
+
+The data set exhibits a clear bias towards the very low alcohol wines. This was to be expected as Portuguese vinho verde is a typical case of very low alcohol wine.
+
+As a final step, I investigate the distribution of the outliers in the heavily skewed distributions:
+
+```{r include=TRUE, fig.height=3}
+
+# draw the histograms for the heavily skewed distributions
+outliergraphs <- lapply(c(5, 6, 7, 9), 
+                       function(x) qplot(colnames(wines)[x], 
+                                         wines[,x], 
+                                         xlab="",
+                                         ylab="", 
+                                         geom="boxplot") + 
+                                   theme_bw())
+do.call("grid.arrange", c(outliergraphs, ncol=4))
+
+```
+
+These new graphs confirm that using logarithmic scales for chlorides and free.sulfur.dioxide is a sensible choice. Their logarithmic representation (see a previous graph) resemble more normal distributions, exhibiting few outliers.
+
+```{r include=TRUE}
+
+# add variables for the log versions of chlorides and free.sulfur.dioxide
+wines$log.chlorides <- wines$chlorides
+wines$log.free.sulfur.dioxide <- wines$free.sulfur.dioxide
+
+# add quantified variable for quality
+wines$thr.quality <- cut(wines$quality, c(0, 5.5, 7.5, 10), 
+                     labels=c("poor", "average", "good"))
+
+# add quantified variable for density
+wines$thr.density <- cut(wines$density, c(0, 0.98, 0.99, 1, 1.01, 10))
+
+```
+
+Based on the observations above, I extended the original data set with several new columns: 
+
+* two categorical variables based on the thresholds of sugar and alcohol (thr.sugar and thr.alcohol) - for use in easier displaying of information
+* two numerical variables based on the logarithms of chlorides and free.sulfur.dioxide (log.chlorides, log.free.sulfur.dioxide) - motivated by a significant increase in correlation with the 'quality' variable (25% and 1137% respectively)
+* two quantified variables (quality, density) - for ease of displaying info
+
+#### Summary
+
+* **Structure of the dataset:** 4898 observations of 13 variables
+* **Main features of interest:** the quality of the wine which is a function of several characteristics (alcohol, density)
+* **Additional features of interest:** several other variables are loosely correlated with quality (residual.sugar, volatile.acidity)
+* **New variables created:** log.chlorides, log.free.sulphur.dioxide (log versions of original variables); thr.sugar, thr.alcohol (tresholded versions of the original variables), thr.quality, thr.density
+* **Unusual distributions:** residual.sugar is a multimodal distribution
+* **Data tidy, adjust or change operations:** apart from the newly introduced variables, no other modifications were performed.
+
+------
+
+### Bivariate Analysis
+
+I started by exploring the correlation between all the pair-wise variables:
+
+```{r include=TRUE}
+
+# create a new variable
+newwines <- wines[, c(2:5, 8:13, 16:17)]
+
+#########################################################################
+#   this code generates the cached image below but takes forever to run 
+#########################################################################
+## create a plot matrix
+#mygraph <- ggpairs(data=newwines) + theme(axis.text=element_blank())
+#
+## rotate the labels on the left axis
+#print(mygraph, left=1, bottom=0.2)
+#g <- grid.ls(print=FALSE)
+#idx <- g$name[grep("text", g$name)]
+#for(i in idx[1:ncol(newwines)]) {
+#  grid.edit(gPath(i), rot=0, just='right', hjust=0)
+#}
+#
+## change all text sizes in the graph
+#for(i in idx) {
+#  grid.edit(gPath(i), gp=gpar(fontsize=10))
+#}
+
+#########################################################################
+# load and display the cached image - much faster
+#########################################################################
+im <- load.image('gridmatrix.png')
+par(mar=c(0,0,0,0))
+plot(im, ann=FALSE, axes=FALSE)
+
+```
+
+Most of the correlation coefficients in the above image are close to zero, with a few notable exceptions. A better look at the correlations is provided by:
+
+```{r include=TRUE, fig.height=6, fig.width=7}
+
+# create a correlation matrix plot
+corrplot(cor(wines[,2:13]), type='lower', order='FPC', tl.cex=.8, 
+         title='', 
+         diag=FALSE, mar=c(0,0,1,0),
+         col=rainbow(200, start=0, end=2./6.))
+
+```
+
+This graph is intended as a helping tool for training classifiers. I have color and size coded the correlations between the variables in the original data set. Several observations can be made:
+
+* alcohol is correlated with roughly half of the features in the set
+* the acidity variables are correlated among themselves (pH with fixed.acidity which in turn correlates with citric.acid)
+* the sulfur variables also match (total.sulfur.dioxide and free.sulfur.dioxide)
+* quality is one of the weakest correlated variables - only alcohol seems to match it
+
+I will try to get a better understanding of how quality is related to other variables:
+
+```{r include=TRUE, fig.height=6}
+
+# create a plot matrix for quality related variables
+qualitygraphs <- lapply(c(2, 6, 9, 11), function(x) 
+  ggplot(newwines, aes(x=factor(quality), y=newwines[, x])) + 
+  geom_point(position=position_jitter(w=0.5, h=0), alpha=.1) + 
+  ylab(colnames(newwines)[x]) + 
+  geom_boxplot(alpha=0.3) +
+  theme_bw())
+
+do.call("grid.arrange", c(qualitygraphs, ncol=2))
+
+```
+
+With maybe the exception of alcohol (higher values correlate with higher quality), no clear relationship related to quality stands out from these graphs. This is justified also by the small correlation found between the variables: (-0.195 - volatile.acidity, -0.3 - density, 0.436 - alcohol and 0.21 - log.chlorides).
+
+Alcohol seems to be correlated to most of the variables in the dataset. It is exhibiting the largest correlation coefficients with the other variables (density -0.78, residual.sugar -0.451, total.sulphur.dioxide -0.449, log.chlorides -0.36).
+
+Density correlates strongly with residual.sugar (0.839) and alcohol (-0.78):
+
+```{r include=TRUE, fig.height=3, fig.width=6}
+
+# graph for density - residual.sugar
+ggplot(wines, aes(x=residual.sugar, y=density)) + 
+  geom_point( alpha=.1) +
+  xlim(0, 25) +
+  ylim(0.985, 1.005) + 
+  stat_smooth(method="lm") +
+  theme_bw()
+
+# graph for density - alcohol
+ggplot(wines, aes(x=alcohol, y=density)) + 
+  geom_point(alpha=.2, position=position_jitter(w=0.12, h=0)) +
+  stat_smooth(method="lm") +
+  ylim(0.985, 1.005) + 
+  theme_bw()
+
+```
+
+#### Summary
+
+* **Relationships observed** - the main feature of interest (the quality of the wine samples) correlates weakly with the given variables.
+* **Interesting relationships between other features** - several other relations are visible from the matrix of graphs. For example, density correlates with residual.sugar and with volatile.acidity.
+* **Strongest relationship found** - residual.sugar and density with a correlation value of 0.839.
+
+
+
+
+------
+
+### Multivariate Analysis
+
+As shown in the previous section, density correlated with residual.sugar. In the next graph, I am using color code to explore if quality is also affected by this relation. For ease of visualization, I will be using a quantified version of quality on three levels:
+
+```{r include=TRUE, fig.height=3, fig.width=8}
+
+# graph sugar-density with coloring function of quality
+ggplot(wines, aes(x=residual.sugar, y=density)) + 
+  geom_point(aes(color=factor(wines$thr.quality)), alpha=.3) + 
+  xlim(0, 25) +
+  ylim(0.985, 1.005) +
+  scale_color_manual(values=c("red", "green", "blue")) +
+  stat_smooth(aes(color=factor(wines$thr.quality)), 
+              se=FALSE,
+              method="lm",
+              alpha=0.1) +
+  labs(color="Wine quality") +
+  theme_bw()
+
+```
+
+Let's see how the relationship holds for each of the three classes:
+```{r include=TRUE, fig.width=6}
+
+# sugar versus density expanded as function of quality classes
+ggplot(wines, aes(x=residual.sugar, y=density)) + 
+  geom_point(alpha=.1) + 
+  facet_grid(thr.quality ~ .) +
+  xlim(0, 25) +
+  ylim(0.985, 1.005) + 
+  stat_smooth(method="lm") +
+  theme_bw()
+
+```
+
+Even at this large level of magnification on the y axis a linear relationship is obvious. Additionally, the quality seems to be directly linked also with the spread of values on the x axis.
+
+```{r include=TRUE, fig.height=3, fig.width=8}
+
+# plot acidity versus sugar, color function of density
+ggplot(wines, aes(x=volatile.acidity, y=residual.sugar)) + 
+  geom_point(aes(color=thr.density), 
+             alpha=.5, 
+             position=position_jitter(w=0.125, h=0.05)) + 
+  scale_color_manual(values=c("red", "green", "blue", "black")) +
+  xlim(0, 0.9) +
+  ylim(0, 40) + 
+  stat_smooth(aes(color=factor(thr.density)), 
+              se=FALSE,
+              method="lm",
+              alpha=0.1) +
+  labs(color="Density") +
+  theme_bw()
+
+```
+
+```{r include=TRUE, fig.width=6}
+
+# acidity versus sugar graphs, for each quality class
+ggplot(wines, aes(x=volatile.acidity, y=residual.sugar)) + 
+  geom_point(aes(color=thr.density), 
+             alpha=.3, 
+             position=position_jitter(w=0.125, h=0.05)) + 
+  scale_color_manual(values=c("red", "green", "blue", "black")) +
+  facet_grid(thr.quality ~ .) +
+  xlim(0, 0.9) +
+  ylim(0, 40) + 
+  stat_smooth(aes(color=thr.density), method="lm", se=FALSE) +
+  labs(color="Density") +
+  theme_bw()
+
+```
+
+The volatile.acidity adds little information - the spread on the x axis is reduced for good-quality wines and spread to the maximum for the poor wines. The relationship between residual.sugar and density is strongly visible even for the quantified version of density.
+
+total.sulfur.dioxide is correlated with log.free.sulfur.dioxide as can be seen in the following graphs. Over-imposing the density shows a clear correlation only with the total.sulphur.dioxide. I added a linear interpolation for each of the classes:
+
+```{r include=TRUE, fig.height=3, fig.width=8}
+
+# plot for the two sulfur variables, colored by density
+ggplot(wines, aes(x=log.free.sulfur.dioxide, y=total.sulfur.dioxide)) + 
+  geom_point(aes(color=thr.density), 
+             alpha=.5, 
+             position=position_jitter(w=0.75, h=0.05)) + 
+  scale_color_manual(values=c("green", "red", "blue", "black")) +
+  xlim(0, 100) +
+  ylim(0, 300) + 
+  stat_smooth(aes(color=thr.density), 
+              se=FALSE,
+              method="lm",
+              alpha=0.1) +
+  labs(color="Density") +
+  theme_bw()
+
+```
+
+```{r include=TRUE, fig.width=6}
+
+# expanded graphs for sulfur variables, clustered by density
+ggplot(wines, aes(x=log.free.sulfur.dioxide, y=total.sulfur.dioxide)) + 
+  geom_point(alpha=.5, position=position_jitter(w=1, h=0.05)) + 
+  scale_color_manual(values=c("red", "green", "blue", "black")) +
+  facet_grid(thr.density ~ .) +
+  xlim(0, 100) +
+  ylim(0, 300) + 
+  stat_smooth(method="lm") +
+  theme_bw()
+
+```
+ 
+
+As a final step in this section, I am interested which are the important features in the dataset from a classification perspective. As the correlations with the target variable are small, I expect a different ranking for different classifiers. The graphs below show the normalized feature importances for linear regression and random forrest. As the goal of this project is not to find the best classifier available, I left all the parameters to default values. Cross validation was used to estimate the machine learning performance.
+
+As expected, the two sets of features have a different ordering. The interesting fact is that the random forrest classifier is slightly better then the proposed SVM classifier in the original paper (relative improvement of ~10%):
+
+```{r include=TRUE, fig.width=6, fig.height=4}
+
+# train a random forrest for classification, use cross variance for estimating the quality of prediction
+rf_model <- train(factor(quality) ~ ., 
+                  data=newwines[,1:12], 
+                  method="rf", 
+                  ntree=100,
+                  trControl=trainControl(method="cv", number=3), 
+                  prox=TRUE, 
+                  allowParallel=TRUE)
+
+# scale and center data
+temp <- wines[,2:12]
+temp <- as.data.frame(scale(temp))
+temp$quality <- wines$quality
+# try linear regression
+lm_model <- train(quality ~ ., 
+                  data=temp, 
+                  method="lm",
+                  trControl=trainControl(method="cv", number=3))
+
+#print(rf_model)
+#print(lm_model)
+#print(rf_model$finalModel)
+#print(lm_model$finalModel)
+
+# estimate variable importance
+importance <- varImp(rf_model)
+importancelm <- varImp(lm_model)
+
+#print(importance)
+#print(importancelm)
+
+plot(importance, xlab='Variable importance for random forrest classifier')
+plot(importancelm, xlab='Variable importance for linear regression')
+
+```
+
+#### Summary
+
+* **Relationships observed in this part of the investigation:** After surveying groups of three variables I could not find novel major interactions apart from the ones shown in the bivariate section. 
+* **Surprising interactions between features:** not really. All combinations showed overlapped clusters - no clear novel insight gained.
+* **Models with the dataset** - yes, I trained a linear regression and a random forrest classifier. Both of them were trained for the purpose of exploring which were the most interesting features in the dataset. As expected, the ordering of the features was slightly different in the two cases. Also, as expected, at closer inspection, the random forrest exhibits a similar pattern as the SVM model in the original paper: no data is correctly classified for the classes of quality 3 and 9. The explanation is that this kind of ensemble estimator performs bad for the border classes. The averaging operation tends to bin more values in the middle classes. Also, the classes are not equally represented and I took no steps of balancing the dataset.
+
+------
+
+### Final Plots and Summary
+
+------
+
+#### Plot One
+
+```{r include=TRUE, fig.width=8, fig.height=4}
+
+# histogram of the residual sugar
+ggplot(wines, aes(x=residual.sugar)) + 
+  scale_x_log10(
+    breaks=c(0.1,1,2,5,10,20,50),
+    labels=waiver()) + 
+  geom_histogram(aes(fill=wines$thr.sugar), binwidth=.05) + 
+  scale_fill_manual(values=c("orange", "blue", "green", "red")) +
+  ggtitle("Residual sugar distribution across samples") + 
+  labs(fill='Wine sweetness', 
+       x="Residual sugar (g/dm^3)", 
+       y="Number of values") +
+  geom_density(aes(y=..scaled..*240), color='lightgrey') +
+  theme_bw()
+
+```
+
+This plot showcases the histogram and the scaled distribution of the residual sugar variable, on a logarithmic scale. Several things can be noticed: 
+
+* first, the class of sweet wines is virtually not present in the dataset (only one instance in almost 5000 samples). 
+* second, the thresholds taken from literature map very well the density peaks - leading to the conclusion that the thresholds for the categories were not randomly chosen. Experts certainly have a deeper understanding of how much sugar can actually be present in wines. 
+* third, the dry wines are a majority in this data set (even visible on the logarithmic scale).
+
+
+------
+
+#### Plot Two
+
+```{r include=TRUE, fig.width=7, fig.height=4}
+
+# plot alcohol versus quality
+ggplot(wines, aes(x=factor(quality), y=alcohol)) + 
+  geom_point(position=position_jitter(w=0.5, h=0), alpha=.05) + 
+  xlab('Quality (discrete value between 1 and 10)') +
+  ylab('Alcohol (% by volume)') + 
+  geom_boxplot(alpha=0.3) +
+  theme_bw()
+
+```
+
+This plot shows the distribution of alcohol values across various quality thresholds. The graph supports the general opinion that, in general, wines with higher quantity of alcohol are perceived as being of higher quality. 
+
+The graph indirectly shows the large variance in the distribution of the samples across the classes, where for quality 3 and 9 very few samples are available. It also shows that the correlation between alcohol and quality is moderate - a large number of outliers is present in the figure and almost all quality bins span across the whole alcohol range.
+
+------
+
+#### Plot Three
+
+
+```{r include=TRUE, fig.width=8, fig.height=4}
+
+# plot residual sugar versus density and differentiate by quality
+ggplot(wines, aes(x=residual.sugar, y=density)) + 
+  geom_point(aes(color=factor(wines$thr.quality)), alpha=.3) + 
+  stat_smooth(method="lm", 
+              aes(color=factor(wines$thr.quality)), 
+              se=FALSE, 
+              alpha=0.1) +
+  xlim(0, 25) +
+  ylim(0.985, 1.005) +
+  scale_color_manual(values=c("red", "#9999ff", "black")) +
+  labs(color="Wine quality", 
+       x="Residual sugar (g/dm^3)", 
+       y="Density (g/cm^3)") +
+  ggtitle("Density versus residual sugar for different wine qualities") +
+  theme_bw()
+
+```
+
+In this plot I am trying to show the strong correlation between density and residual sugar. Although the graph shows quite some variation, the y axis does not start at 0 - changing it would result in an almost straight line, making this point stronger. By dividing the wine quality in three categories and using a linear regression model for each class, we notice a clear ordering of the cluster points from the three classes, with better wines having a lower density and less residual sugar.
+
+------
+
+### Reflection
+
+In this project I have analyzed the white wines dataset provided by udacity. Visualization of the variables in the dataset helped a lot grasping more understanding of the information hidden within. 
+
+My major struggle was to find a direct correlation between the quality of the wine and the given variables. Looking at the correlation plots, it seems that the quality is an insignificant variable. My first instinct was to dismiss it with an excuse such as: "tasting wines is as subjective as any human action can be". Then I paid a bit of attention on how data is collected: the opinions of three reviewers are averaged. So, the actual human observations are modified by two quantification steps (original marks given by reviewers and the average transformed to an integer mark) and one averaging step (which removes samples from the border categories). Once this was clear, then I understood why the authors of the paper were forced to further average the quality marks in order to boost the performance of their classifier.
+
+The other major struggle was to find combinations of two variables that show clear clusters of quality-related data. This struggle was not fully satisfied - alhough clustering is to be found in the graphs in the multivariate section, clear distinctions between the classes is not present. Peeking again at the original paper, it seems that the authors also failed to identify any at all.
+
+General qualitative observations from wikipedia state that, while accounting for exceptions, superior wines have high percentage of alcohol and low levels of sugar. This observation matches somewhat the data. Also, it is noted that the perceived sweetness can be modified for example by acidity (I also wonder about temperature, given that we deal with white wine). All in all, some chemistry knowledge would probably help creating a better variable for perceived sweetness. As future work, I would recommend searching the literature on how the chemicals in the data set modify perceived sweetness and build a variable based on the findings. I would be astonished if the popular knowledge is not verified by the data.

@@ -1,0 +1,10 @@
+list of websites with info:
+
+sweetness of wines wikipedia page:
+https://en.wikipedia.org/wiki/Sweetness_of_wine
+
+alcohol in white wines info:
+http://www.realsimple.com/holidays-entertaining/entertaining/food-drink/alcohol-content-wine
+
+original paper linked to the data set:
+https://www.stat.auckland.ac.nz/~stats330/datasets.dir/cortez2009.pdf
